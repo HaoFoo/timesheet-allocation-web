@@ -31,6 +31,11 @@
     th,td{border:1px solid #d1d5db;padding:6px 8px;text-align:center;white-space:nowrap}
     th{background:#f3f4f6}
     .sum{font-weight:700;background:#fafafa}
+    .bg-a{background:#eefbf7}
+    .bg-b{background:#eef5ff}
+    .bg-c{background:#fff8eb}
+    .bg-d{background:#f6f0ff}
+    .bg-s{background:#eef2f7}
     .left{text-align:left}
     @media (max-width:980px){.top{grid-template-columns:1fr}}
 </style>
@@ -50,6 +55,7 @@
       </div>
       <div class="btns">
         <button class="primary" id="gen">自动生成分配结果（全部人员）</button>
+        <button class="ghost" id="rerun">重新生成一次</button>
         <button class="soft" id="copy">复制当前人员表格（TSV）</button>
         <button class="soft" id="download">下载分配结果 Excel</button>
         <button class="ghost" id="demo">载入示例汇总数据</button>
@@ -85,6 +91,7 @@ let personTables={};
 let uploadedRows=[];
 let uploadedWorkbook=null;
 let uploadedFileName='';
+let rerunNonce = 0;
 
 const toHHMM = m => `${String(Math.floor((m%1440)/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`;
 const timeFraction = m => (((m%1440)+1440)%1440)/1440;
@@ -95,8 +102,6 @@ const alloc=(cursor,h)=>{
   let need=Math.round(h*60);
   if(cursor<AM_S) cursor=AM_S;
   if(cursor>=AM_E && cursor<PM_S) cursor=PM_S;
-  if(cursor<AM_E && cursor+need>AM_E) cursor=PM_S;
-  if(cursor>=PM_S && cursor<PM_E && cursor+need>PM_E) cursor=PM_E;
   let end = cursor + need;
   let truncated = false;
   if(end > NEXT_DAY_0830){
@@ -104,6 +109,12 @@ const alloc=(cursor,h)=>{
     truncated = true;
   }
   return {s:cursor,e:end,n:end,truncated};
+};
+const fitBoundary = (cursor) => {
+  if(cursor < AM_E) return AM_E;
+  if(cursor >= AM_E && cursor < PM_S) return PM_S;
+  if(cursor < PM_E) return PM_E;
+  return NEXT_DAY_0830;
 };
 const cval = (ws, r, c) => {
   const ref = XLSX.utils.encode_cell({r, c});
@@ -210,8 +221,70 @@ function seededShuffle(arr, seed){
 
 function projectOrderForDay(name, day, month, projectHours){
   const active = PROJECTS.filter(p => (projectHours[p] || 0) > 0);
-  const seed = hashSeed(`${name}|${month||0}|${day}`);
+  const seed = hashSeed(`${name}|${month||0}|${day}|${rerunNonce}`);
   return seededShuffle(active, seed);
+}
+
+function scheduleDay(name, day, month, projectHours){
+  const order = projectOrderForDay(name, day, month, projectHours);
+  const remaining = {};
+  order.forEach(p => { remaining[p] = Math.round((projectHours[p] || 0) * 60); });
+  const assigned = {};
+  PROJECTS.forEach(p => { assigned[p] = {start:'', end:'', sum:(projectHours[p] || 0)}; });
+
+  let cursor = AM_S;
+  let truncations = 0;
+  const pending = order.slice();
+
+  // 硬约束：每天第一段必须从 08:30 开始，且项目按随机顺序决定
+  if(pending.length){
+    const first = pending[0];
+    const mins = remaining[first] || 0;
+    if(mins > 0){
+      const a = alloc(cursor, mins / 60);
+      if(a.s < a.e){
+        assigned[first].start = toHHMM(a.s); // 必须为 08:30
+        assigned[first].end = toHHMM(a.e);
+        const used = a.e - a.s;
+        remaining[first] = Math.max(0, remaining[first] - used);
+        cursor = a.e;
+        if(a.truncated) truncations += 1;
+        if(remaining[first] <= 0) pending.shift();
+      }
+    }else{
+      pending.shift();
+    }
+  }
+
+  while(pending.length && cursor < NEXT_DAY_0830){
+    if(cursor >= AM_E && cursor < PM_S) cursor = PM_S;
+    const boundary = fitBoundary(cursor);
+    const slot = Math.max(0, boundary - cursor);
+
+    // 优先在当前工作时段内找能放下的项目，避免提前进入加班
+    let pickedIdx = pending.findIndex(p => remaining[p] > 0 && remaining[p] <= slot);
+    if(pickedIdx < 0) pickedIdx = pending.findIndex(p => remaining[p] > 0);
+    if(pickedIdx < 0) break;
+
+    const p = pending[pickedIdx];
+    const mins = remaining[p];
+    const hours = mins / 60;
+    const a = alloc(cursor, hours);
+    if(a.s < a.e){
+      if(!assigned[p].start) assigned[p].start = toHHMM(a.s);
+      assigned[p].end = toHHMM(a.e);
+      const used = a.e - a.s;
+      remaining[p] = Math.max(0, remaining[p] - used);
+      cursor = a.e;
+      if(a.truncated) truncations += 1;
+      if(remaining[p] <= 0) pending.splice(pickedIdx, 1);
+    }else{
+      truncations += 1;
+      break;
+    }
+  }
+
+  return {assigned, truncations, order};
 }
 
 function buildPersonTable(name, rows, yearMonth){
@@ -223,23 +296,8 @@ function buildPersonTable(name, rows, yearMonth){
 
   const out=[];
   days.forEach(day=>{
-    const projectTimes={};
-    PROJECTS.forEach(p=>projectTimes[p]={start:'',end:'',sum:0});
-    let cursor=AM_S;
-    PROJECTS.forEach(p=>{
-      const h=map[day][p]||0;
-      projectTimes[p].sum=h;
-    });
-    const order = projectOrderForDay(name, day, yearMonth.month, map[day]);
-    order.forEach(p=>{
-      const h = map[day][p] || 0;
-      const a = alloc(cursor, h);
-      if(h > 0 && a.s < a.e){
-        projectTimes[p].start = toHHMM(a.s);
-        projectTimes[p].end = toHHMM(a.e);
-      }
-      cursor = a.n;
-    });
+    const scheduled = scheduleDay(name, day, yearMonth.month, map[day]);
+    const projectTimes = scheduled.assigned;
     out.push({year:yearMonth.year||'',month:yearMonth.month||'',day,projectTimes});
   });
   return out;
@@ -302,21 +360,20 @@ function applyAllocationToWorkbook(workbook, rows){
         clearCell(ws, r, s.endCol);
       });
       const pHours = idx[name][day] || {};
-      let cursor = AM_S;
-      const order = projectOrderForDay(name, day, ym.month, pHours);
-      order.forEach(project=>{
+      const scheduled = scheduleDay(name, day, ym.month, pHours);
+      PROJECTS.forEach(project=>{
         const s = slotMap[project];
         if(!s) return;
-        const h = Number(pHours[project] || 0);
-        if(!(h>0)) return;
-        const a = alloc(cursor, h);
-        if(a.s < a.e){
-          setCell(ws, r, s.startCol, timeFraction(a.s), 'n', 'h:mm');
-          setCell(ws, r, s.endCol, timeFraction(a.e), 'n', 'h:mm');
+        const st = scheduled.assigned[project]?.start || '';
+        const ed = scheduled.assigned[project]?.end || '';
+        if(st && ed){
+          const [sh, sm] = st.split(':').map(Number);
+          const [eh, em] = ed.split(':').map(Number);
+          setCell(ws, r, s.startCol, timeFraction(sh*60+sm), 'n', 'h:mm');
+          setCell(ws, r, s.endCol, timeFraction(eh*60+em), 'n', 'h:mm');
         }
-        if(a.truncated) truncations += 1;
-        cursor = a.n;
       });
+      truncations += scheduled.truncations;
     }
   });
   return {truncations};
@@ -365,14 +422,14 @@ function renderTable(name){
   rows.forEach(r=>{
     html += '<tr>'+
       `<td>${r.year}</td><td>${r.month}</td><td>${r.day}</td>`+
-      `<td>${r.projectTimes['气泡酒'].start}</td><td>${r.projectTimes['气泡酒'].end}</td>`+
-      `<td>${r.projectTimes['康普茶'].start}</td><td>${r.projectTimes['康普茶'].end}</td>`+
-      `<td>${r.projectTimes['XX项目'].start}</td><td>${r.projectTimes['XX项目'].end}</td>`+
-      `<td>${r.projectTimes['基础研发'].start}</td><td>${r.projectTimes['基础研发'].end}</td>`+
-      `<td class="sum">${r.projectTimes['气泡酒'].sum||0}</td>`+
-      `<td class="sum">${r.projectTimes['康普茶'].sum||0}</td>`+
-      `<td class="sum">${r.projectTimes['XX项目'].sum||0}</td>`+
-      `<td class="sum">${r.projectTimes['基础研发'].sum||0}</td>`+
+      `<td class="bg-a">${r.projectTimes['气泡酒'].start}</td><td class="bg-a">${r.projectTimes['气泡酒'].end}</td>`+
+      `<td class="bg-b">${r.projectTimes['康普茶'].start}</td><td class="bg-b">${r.projectTimes['康普茶'].end}</td>`+
+      `<td class="bg-c">${r.projectTimes['XX项目'].start}</td><td class="bg-c">${r.projectTimes['XX项目'].end}</td>`+
+      `<td class="bg-d">${r.projectTimes['基础研发'].start}</td><td class="bg-d">${r.projectTimes['基础研发'].end}</td>`+
+      `<td class="sum bg-s">${r.projectTimes['气泡酒'].sum||0}</td>`+
+      `<td class="sum bg-s">${r.projectTimes['康普茶'].sum||0}</td>`+
+      `<td class="sum bg-s">${r.projectTimes['XX项目'].sum||0}</td>`+
+      `<td class="sum bg-s">${r.projectTimes['基础研发'].sum||0}</td>`+
       '</tr>';
   });
 
@@ -416,6 +473,17 @@ function copyCurrent(){
 }
 
 document.getElementById('gen').onclick=buildAll;
+document.getElementById('rerun').onclick=()=>{
+  const textRows=parseRows(document.getElementById('raw').value);
+  const rows = uploadedRows.length ? uploadedRows : textRows;
+  if(!rows.length){
+    document.getElementById('status').textContent='请先上传或录入数据';
+    return;
+  }
+  rerunNonce += 1;
+  buildAll();
+  document.getElementById('status').textContent=`已重新生成（第 ${rerunNonce + 1} 次）`;
+};
 document.getElementById('copy').onclick=copyCurrent;
 document.getElementById('download').onclick=()=>{
   if(!uploadedWorkbook || !uploadedRows.length){
