@@ -78,6 +78,7 @@ if(typeof XLSX === 'undefined'){
 </script>
 <script>
 const AM_S=510, AM_E=720, PM_S=780, PM_E=1050;
+const NEXT_DAY_0830 = AM_S + 24 * 60;
 const PROJECTS=['气泡酒','康普茶','XX项目','基础研发'];
 let currentPerson='';
 let personTables={};
@@ -88,12 +89,21 @@ let uploadedFileName='';
 const toHHMM = m => `${String(Math.floor((m%1440)/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`;
 const timeFraction = m => (((m%1440)+1440)%1440)/1440;
 const alloc=(cursor,h)=>{
+  if(cursor >= NEXT_DAY_0830){
+    return {s: NEXT_DAY_0830, e: NEXT_DAY_0830, n: NEXT_DAY_0830, truncated: h > 0};
+  }
   let need=Math.round(h*60);
   if(cursor<AM_S) cursor=AM_S;
   if(cursor>=AM_E && cursor<PM_S) cursor=PM_S;
   if(cursor<AM_E && cursor+need>AM_E) cursor=PM_S;
   if(cursor>=PM_S && cursor<PM_E && cursor+need>PM_E) cursor=PM_E;
-  return {s:cursor,e:cursor+need,n:cursor+need};
+  let end = cursor + need;
+  let truncated = false;
+  if(end > NEXT_DAY_0830){
+    end = NEXT_DAY_0830;
+    truncated = true;
+  }
+  return {s:cursor,e:end,n:end,truncated};
 };
 const cval = (ws, r, c) => {
   const ref = XLSX.utils.encode_cell({r, c});
@@ -178,6 +188,32 @@ function findPersonYearMonth(workbook, person){
   return {year: Number(cval(ws,2,0)||''), month:Number(cval(ws,2,1)||'')};
 }
 
+function hashSeed(str){
+  let h = 2166136261;
+  for(let i=0;i<str.length;i++){
+    h ^= str.charCodeAt(i);
+    h += (h<<1) + (h<<4) + (h<<7) + (h<<8) + (h<<24);
+  }
+  return h >>> 0;
+}
+
+function seededShuffle(arr, seed){
+  const out = arr.slice();
+  let s = seed >>> 0;
+  for(let i=out.length-1;i>0;i--){
+    s = (s * 1664525 + 1013904223) >>> 0;
+    const j = s % (i + 1);
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+function projectOrderForDay(name, day, month, projectHours){
+  const active = PROJECTS.filter(p => (projectHours[p] || 0) > 0);
+  const seed = hashSeed(`${name}|${month||0}|${day}`);
+  return seededShuffle(active, seed);
+}
+
 function buildPersonTable(name, rows, yearMonth){
   const days=Array.from({length:31},(_,i)=>i+1);
   const map={}; days.forEach(d=>{map[d]={}});
@@ -193,12 +229,16 @@ function buildPersonTable(name, rows, yearMonth){
     PROJECTS.forEach(p=>{
       const h=map[day][p]||0;
       projectTimes[p].sum=h;
-      if(h>0){
-        const a=alloc(cursor,h);
-        projectTimes[p].start=toHHMM(a.s);
-        projectTimes[p].end=toHHMM(a.e);
-        cursor=a.n;
+    });
+    const order = projectOrderForDay(name, day, yearMonth.month, map[day]);
+    order.forEach(p=>{
+      const h = map[day][p] || 0;
+      const a = alloc(cursor, h);
+      if(h > 0 && a.s < a.e){
+        projectTimes[p].start = toHHMM(a.s);
+        projectTimes[p].end = toHHMM(a.e);
       }
+      cursor = a.n;
     });
     out.push({year:yearMonth.year||'',month:yearMonth.month||'',day,projectTimes});
   });
@@ -244,11 +284,15 @@ function rowByDay(ws){
 function applyAllocationToWorkbook(workbook, rows){
   const idx = buildAllocationIndex(rows);
   const people = Object.keys(idx);
+  let truncations = 0;
   people.forEach(name=>{
     const ws = workbook.Sheets[name];
     if(!ws) return;
     const slots = getProjectSlots(ws);
+    const slotMap = {};
+    slots.forEach(s=>{slotMap[s.project] = s;});
     const dayRow = rowByDay(ws);
+    const ym = findPersonYearMonth(workbook, name);
 
     for(let day=1; day<=31; day++){
       const r = dayRow[day];
@@ -259,16 +303,23 @@ function applyAllocationToWorkbook(workbook, rows){
       });
       const pHours = idx[name][day] || {};
       let cursor = AM_S;
-      slots.forEach(s=>{
-        const h = Number(pHours[s.project] || 0);
+      const order = projectOrderForDay(name, day, ym.month, pHours);
+      order.forEach(project=>{
+        const s = slotMap[project];
+        if(!s) return;
+        const h = Number(pHours[project] || 0);
         if(!(h>0)) return;
         const a = alloc(cursor, h);
-        setCell(ws, r, s.startCol, timeFraction(a.s), 'n', 'h:mm');
-        setCell(ws, r, s.endCol, timeFraction(a.e), 'n', 'h:mm');
+        if(a.s < a.e){
+          setCell(ws, r, s.startCol, timeFraction(a.s), 'n', 'h:mm');
+          setCell(ws, r, s.endCol, timeFraction(a.e), 'n', 'h:mm');
+        }
+        if(a.truncated) truncations += 1;
         cursor = a.n;
       });
     }
   });
+  return {truncations};
 }
 
 function enforceHeaderBlackFont(workbook){
@@ -372,12 +423,13 @@ document.getElementById('download').onclick=()=>{
     return;
   }
   try{
-    applyAllocationToWorkbook(uploadedWorkbook, uploadedRows);
+    const result = applyAllocationToWorkbook(uploadedWorkbook, uploadedRows);
     enforceHeaderBlackFont(uploadedWorkbook);
     const base = uploadedFileName.replace(/\.xlsx$/i, '') || '工时记录表';
     const outName = `${base}_自动分配.xlsx`;
     XLSX.writeFile(uploadedWorkbook, outName, {cellStyles:true});
-    document.getElementById('status').textContent=`已下载结果文件：${outName}`;
+    const warn = result.truncations > 0 ? `（${result.truncations} 条记录触发了T+1 08:30上限）` : '';
+    document.getElementById('status').textContent=`已下载结果文件：${outName}${warn}`;
   }catch(err){
     document.getElementById('status').textContent=`导出失败：${err.message || err}`;
   }
