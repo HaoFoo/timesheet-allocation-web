@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>工时分配工具 - 高保真原型</title>
+  <style>
+    :root{--bg:#f3f5f7;--panel:#fff;--text:#111827;--muted:#6b7280;--line:#e5e7eb;--brand:#0f766e;--soft:#d1fae5}
+    *{box-sizing:border-box}
+    body{margin:0;background:linear-gradient(140deg,#eef2f7 0%,#f9fafb 60%,#ecfeff 100%);font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;color:var(--text)}
+    .wrap{max-width:1380px;margin:20px auto;padding:0 14px}
+    .title{font-size:28px;font-weight:700;margin:0 0 8px}
+    .sub{color:var(--muted);margin:0 0 14px}
+    .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 10px 24px rgba(15,23,42,.06)}
+    .top{display:grid;grid-template-columns:1.3fr 1fr;gap:12px}
+    label{font-size:12px;color:var(--muted);display:block;margin-bottom:6px}
+    input,button,textarea{font:inherit}
+    input,textarea{width:100%;border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+    textarea{min-height:120px;resize:vertical}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
+    button{border:0;border-radius:10px;padding:10px 14px;cursor:pointer}
+    .primary{background:var(--brand);color:#fff}.soft{background:var(--soft);color:#065f46}.ghost{background:#f3f4f6}
+    .hint{font-size:12px;color:#dc2626;margin:8px 0 0}
+    .ok{font-size:12px;color:#166534;margin:8px 0 0}
+    .tabs{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+    .tab{padding:7px 12px;border:1px solid var(--line);border-radius:999px;background:#fff;cursor:pointer}
+    .tab.active{background:#0f766e;color:#fff;border-color:#0f766e}
+    .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:10px}
+    table{border-collapse:collapse;min-width:1280px;width:100%}
+    th,td{border:1px solid #d1d5db;padding:6px 8px;text-align:center;white-space:nowrap}
+    th{background:#f3f4f6}
+    .sum{font-weight:700;background:#fafafa}
+    .left{text-align:left}
+    @media (max-width:980px){.top{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1 class="title">工时记录表自动分配工具</h1>
+  <p class="sub">上传汇总表后，系统自动处理全部人员，不再手动选人。下方预览按你给的模板格式展示。</p>
+
+  <div class="top">
+    <section class="card">
+      <label>汇总表文件</label>
+      <input id="file" type="file" accept=".xlsx,.csv" />
+      <div class="row" style="margin-top:10px">
+        <div><label>上午时段</label><input value="08:30-12:00" disabled /></div>
+        <div><label>下午时段</label><input value="13:00-17:30" disabled /></div>
+      </div>
+      <div class="btns">
+        <button class="primary" id="gen">自动生成分配结果（全部人员）</button>
+        <button class="soft" id="copy">复制当前人员表格（TSV）</button>
+        <button class="soft" id="download">下载分配结果 Excel</button>
+        <button class="ghost" id="demo">载入示例汇总数据</button>
+      </div>
+      <p id="status" class="ok">等待上传并生成...</p>
+    </section>
+
+    <section class="card">
+      <label>汇总数据（原型演示用，可粘贴）</label>
+      <textarea id="raw" placeholder="姓名,日期,项目,工时\n顾志媛,1,气泡酒,1.5"></textarea>
+      <p class="hint">真实版会直接读取你上传的 Excel 汇总页。这里仅做前端原型演示。</p>
+    </section>
+  </div>
+
+  <section class="card" style="margin-top:12px">
+    <div id="tabs" class="tabs"></div>
+    <div id="tableContainer" class="table-wrap"></div>
+  </section>
+</div>
+
+<script src="./xlsx.full.min.js"></script>
+<script>
+if(typeof XLSX === 'undefined'){
+  document.write('<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"><\\/script>');
+}
+</script>
+<script>
+const AM_S=510, AM_E=720, PM_S=780, PM_E=1050;
+const PROJECTS=['气泡酒','康普茶','XX项目','基础研发'];
+let currentPerson='';
+let personTables={};
+let uploadedRows=[];
+let uploadedWorkbook=null;
+let uploadedFileName='';
+
+const toHHMM = m => `${String(Math.floor((m%1440)/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`;
+const timeFraction = m => (((m%1440)+1440)%1440)/1440;
+const alloc=(cursor,h)=>{
+  let need=Math.round(h*60);
+  if(cursor<AM_S) cursor=AM_S;
+  if(cursor>=AM_E && cursor<PM_S) cursor=PM_S;
+  if(cursor<AM_E && cursor+need>AM_E) cursor=PM_S;
+  if(cursor>=PM_S && cursor<PM_E && cursor+need>PM_E) cursor=PM_E;
+  return {s:cursor,e:cursor+need,n:cursor+need};
+};
+const cval = (ws, r, c) => {
+  const ref = XLSX.utils.encode_cell({r, c});
+  return ws[ref] ? ws[ref].v : '';
+};
+const setCell = (ws, r, c, v, t='n', z='h:mm') => {
+  const ref = XLSX.utils.encode_cell({r, c});
+  const old = ws[ref] || {};
+  ws[ref] = {t, v};
+  if(old.s) ws[ref].s = old.s;
+  if(z) ws[ref].z = z;
+};
+const clearCell = (ws, r, c) => {
+  const ref = XLSX.utils.encode_cell({r, c});
+  const old = ws[ref] || {};
+  if(old.s){
+    ws[ref] = {t:'z', s:old.s};
+  }else{
+    delete ws[ref];
+  }
+};
+
+function parseRows(text){
+  const rows=[];
+  text.split(/\n+/).forEach(line=>{
+    const raw=String(line||'').trim();
+    if(!raw) return;
+    const p=raw.split(/[，,\t]/).map(v=>v.trim()).filter(Boolean);
+    if(p.length<4) return;
+    const name=p[0];
+    const day=Number(p[1]);
+    const project=p[2];
+    const hours=Number(String(p[3]).replace(/小时|h/ig,'').trim());
+    if(!name||!project||Number.isNaN(day)||day<1||day>31||Number.isNaN(hours)||hours<=0) return;
+    rows.push({name,day,project,hours});
+  });
+  return rows;
+}
+
+function extractRowsFromWorkbook(workbook){
+  const ws = workbook.Sheets['工时记录表'];
+  if(!ws) throw new Error('未找到sheet: 工时记录表');
+
+  const grid = XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:''});
+  const headerRow = grid[5] || [];
+  if(!headerRow.length) throw new Error('汇总表第6行为空，无法识别表头');
+
+  let projectCol = -1;
+  let nameCol = -1;
+  const dayCols = [];
+  for(let c=0;c<headerRow.length;c++){
+    const text = String(headerRow[c] ?? '').trim();
+    if(text === '项目名称') projectCol = c;
+    if(text === '姓名') nameCol = c;
+    const day = Number(text);
+    if(!Number.isNaN(day) && day>=1 && day<=31) dayCols.push({day, col:c});
+  }
+  if(projectCol < 0) throw new Error('未识别到“项目名称”列');
+  if(nameCol < 0) throw new Error('未识别到“姓名”列');
+  if(!dayCols.length) throw new Error('未识别到日期列（第6行1~31）');
+
+  const personSheets = new Set(workbook.SheetNames.filter(n => n !== '工时记录表'));
+  const rows = [];
+  for(let r=6;r<grid.length;r++){
+    const line = grid[r] || [];
+    const project = String(line[projectCol] ?? '').trim();
+    const name = String(line[nameCol] ?? '').trim();
+    if(!project || !name) continue;
+    if(!personSheets.has(name)) continue;
+    for(const d of dayCols){
+      const hours = Number(line[d.col]);
+      if(Number.isNaN(hours) || hours<=0) continue;
+      rows.push({name, day:d.day, project, hours});
+    }
+  }
+  return rows;
+}
+
+function findPersonYearMonth(workbook, person){
+  const ws = workbook.Sheets[person];
+  if(!ws) return {year:'', month:''};
+  return {year: Number(cval(ws,2,0)||''), month:Number(cval(ws,2,1)||'')};
+}
+
+function buildPersonTable(name, rows, yearMonth){
+  const days=Array.from({length:31},(_,i)=>i+1);
+  const map={}; days.forEach(d=>{map[d]={}});
+  rows.filter(r=>r.name===name).sort((a,b)=>a.day-b.day).forEach(r=>{
+    map[r.day][r.project]=(map[r.day][r.project]||0)+r.hours;
+  });
+
+  const out=[];
+  days.forEach(day=>{
+    const projectTimes={};
+    PROJECTS.forEach(p=>projectTimes[p]={start:'',end:'',sum:0});
+    let cursor=AM_S;
+    PROJECTS.forEach(p=>{
+      const h=map[day][p]||0;
+      projectTimes[p].sum=h;
+      if(h>0){
+        const a=alloc(cursor,h);
+        projectTimes[p].start=toHHMM(a.s);
+        projectTimes[p].end=toHHMM(a.e);
+        cursor=a.n;
+      }
+    });
+    out.push({year:yearMonth.year||'',month:yearMonth.month||'',day,projectTimes});
+  });
+  return out;
+}
+
+function buildAllocationIndex(rows){
+  const idx = {};
+  rows.forEach(r=>{
+    const n = r.name;
+    if(!idx[n]) idx[n] = {};
+    if(!idx[n][r.day]) idx[n][r.day] = {};
+    idx[n][r.day][r.project] = (idx[n][r.day][r.project] || 0) + r.hours;
+  });
+  return idx;
+}
+
+function getProjectSlots(ws){
+  const slots=[];
+  const range = XLSX.utils.decode_range(ws['!ref']);
+  for(let c=3;c<=range.e.c;c++){
+    const pName = String(cval(ws,0,c)||'').replace(/\n/g,'').trim();
+    const h1 = String(cval(ws,1,c)||'').trim();
+    const h2 = String(cval(ws,1,c+1)||'').trim();
+    if(pName && h1==='开始时间' && h2==='结束时间'){
+      slots.push({project:pName,startCol:c,endCol:c+1});
+      c += 1;
+    }
+  }
+  return slots;
+}
+
+function rowByDay(ws){
+  const map = {};
+  const range = XLSX.utils.decode_range(ws['!ref']);
+  for(let r=2;r<=range.e.r;r++){
+    const day = Number(cval(ws,r,2));
+    if(!Number.isNaN(day) && day>=1 && day<=31) map[day] = r;
+  }
+  return map;
+}
+
+function applyAllocationToWorkbook(workbook, rows){
+  const idx = buildAllocationIndex(rows);
+  const people = Object.keys(idx);
+  people.forEach(name=>{
+    const ws = workbook.Sheets[name];
+    if(!ws) return;
+    const slots = getProjectSlots(ws);
+    const dayRow = rowByDay(ws);
+
+    for(let day=1; day<=31; day++){
+      const r = dayRow[day];
+      if(!r) continue;
+      slots.forEach(s=>{
+        clearCell(ws, r, s.startCol);
+        clearCell(ws, r, s.endCol);
+      });
+      const pHours = idx[name][day] || {};
+      let cursor = AM_S;
+      slots.forEach(s=>{
+        const h = Number(pHours[s.project] || 0);
+        if(!(h>0)) return;
+        const a = alloc(cursor, h);
+        setCell(ws, r, s.startCol, timeFraction(a.s), 'n', 'h:mm');
+        setCell(ws, r, s.endCol, timeFraction(a.e), 'n', 'h:mm');
+        cursor = a.n;
+      });
+    }
+  });
+}
+
+function enforceHeaderBlackFont(workbook){
+  workbook.SheetNames.forEach(name=>{
+    const ws = workbook.Sheets[name];
+    if(!ws || !ws['!ref']) return;
+    const range = XLSX.utils.decode_range(ws['!ref']);
+    for(let r=0; r<=5; r++){
+      for(let c=0; c<=range.e.c; c++){
+        const ref = XLSX.utils.encode_cell({r,c});
+        const cell = ws[ref];
+        if(!cell) continue;
+        if(!cell.s) cell.s = {};
+        if(!cell.s.font) cell.s.font = {};
+        cell.s.font.color = {rgb:'000000'};
+      }
+    }
+  });
+}
+
+function renderTabs(names){
+  const tabs=document.getElementById('tabs');
+  tabs.innerHTML='';
+  names.forEach((n,i)=>{
+    const b=document.createElement('button');
+    b.className='tab'+(i===0?' active':'');
+    b.textContent=n;
+    b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');currentPerson=n;renderTable(n);};
+    tabs.appendChild(b);
+  });
+}
+
+function renderTable(name){
+  const rows=personTables[name]||[];
+  const c=document.getElementById('tableContainer');
+  let html='<table><thead>'+
+    '<tr><th rowspan="2">年</th><th rowspan="2">月</th><th rowspan="2">日</th>'+
+    '<th colspan="2">气泡酒</th><th colspan="2">康普茶</th><th colspan="2">XX项目</th><th colspan="2">基础研发</th>'+
+    '<th colspan="4">合计</th></tr>'+
+    '<tr><th>开始时间</th><th>结束时间</th><th>开始时间</th><th>结束时间</th><th>开始时间</th><th>结束时间</th><th>开始时间</th><th>结束时间</th><th>气泡酒</th><th>康普茶</th><th>XX项目</th><th>基础研发</th></tr>'+
+    '</thead><tbody>';
+
+  rows.forEach(r=>{
+    html += '<tr>'+
+      `<td>${r.year}</td><td>${r.month}</td><td>${r.day}</td>`+
+      `<td>${r.projectTimes['气泡酒'].start}</td><td>${r.projectTimes['气泡酒'].end}</td>`+
+      `<td>${r.projectTimes['康普茶'].start}</td><td>${r.projectTimes['康普茶'].end}</td>`+
+      `<td>${r.projectTimes['XX项目'].start}</td><td>${r.projectTimes['XX项目'].end}</td>`+
+      `<td>${r.projectTimes['基础研发'].start}</td><td>${r.projectTimes['基础研发'].end}</td>`+
+      `<td class="sum">${r.projectTimes['气泡酒'].sum||0}</td>`+
+      `<td class="sum">${r.projectTimes['康普茶'].sum||0}</td>`+
+      `<td class="sum">${r.projectTimes['XX项目'].sum||0}</td>`+
+      `<td class="sum">${r.projectTimes['基础研发'].sum||0}</td>`+
+      '</tr>';
+  });
+
+  html += '<tr><td class="left sum">合计</td><td class="sum"></td><td class="sum"></td><td class="sum" colspan="12"></td></tr>';
+  html += '</tbody></table>';
+  c.innerHTML=html;
+}
+
+function buildAll(){
+  const textRows=parseRows(document.getElementById('raw').value);
+  const rows = uploadedRows.length ? uploadedRows : textRows;
+  const names=[...new Set(rows.map(r=>r.name))];
+  if(!names.length){document.getElementById('status').textContent='没有可用数据';return;}
+  personTables={};
+  names.forEach(n=>{
+    const ym = uploadedWorkbook ? findPersonYearMonth(uploadedWorkbook, n) : {year:'',month:''};
+    personTables[n]=buildPersonTable(n,rows,ym);
+  });
+  currentPerson=names[0];
+  renderTabs(names);
+  renderTable(currentPerson);
+  document.getElementById('status').textContent=`已完成 ${names.length} 位人员的分配预览`;
+}
+
+function copyCurrent(){
+  if(!currentPerson||!personTables[currentPerson]) return;
+  const rows=personTables[currentPerson];
+  const lines=['年\t月\t日\t气泡酒开始\t气泡酒结束\t康普茶开始\t康普茶结束\tXX项目开始\tXX项目结束\t基础研发开始\t基础研发结束\t气泡酒\t康普茶\tXX项目\t基础研发'];
+  rows.forEach(r=>{
+    lines.push([
+      r.year,r.month,r.day,
+      r.projectTimes['气泡酒'].start,r.projectTimes['气泡酒'].end,
+      r.projectTimes['康普茶'].start,r.projectTimes['康普茶'].end,
+      r.projectTimes['XX项目'].start,r.projectTimes['XX项目'].end,
+      r.projectTimes['基础研发'].start,r.projectTimes['基础研发'].end,
+      r.projectTimes['气泡酒'].sum||0,r.projectTimes['康普茶'].sum||0,r.projectTimes['XX项目'].sum||0,r.projectTimes['基础研发'].sum||0
+    ].join('\t'));
+  });
+  navigator.clipboard.writeText(lines.join('\n'));
+  document.getElementById('status').textContent=`已复制 ${currentPerson} 的预览表`;
+}
+
+document.getElementById('gen').onclick=buildAll;
+document.getElementById('copy').onclick=copyCurrent;
+document.getElementById('download').onclick=()=>{
+  if(!uploadedWorkbook || !uploadedRows.length){
+    document.getElementById('status').textContent='请先上传 Excel 并生成结果';
+    return;
+  }
+  try{
+    applyAllocationToWorkbook(uploadedWorkbook, uploadedRows);
+    enforceHeaderBlackFont(uploadedWorkbook);
+    const base = uploadedFileName.replace(/\.xlsx$/i, '') || '工时记录表';
+    const outName = `${base}_自动分配.xlsx`;
+    XLSX.writeFile(uploadedWorkbook, outName, {cellStyles:true});
+    document.getElementById('status').textContent=`已下载结果文件：${outName}`;
+  }catch(err){
+    document.getElementById('status').textContent=`导出失败：${err.message || err}`;
+  }
+};
+document.getElementById('demo').onclick=()=>{
+  document.getElementById('raw').value=[
+    '顾志媛,1,气泡酒,1.5','顾志媛,1,康普茶,1.5','顾志媛,1,XX项目,3','顾志媛,1,基础研发,1.5',
+    '陈久琴,1,气泡酒,2','陈久琴,1,康普茶,1','陈久琴,1,XX项目,1','陈久琴,1,基础研发,1',
+    '周洪烈,1,气泡酒,1','周洪烈,1,康普茶,1','周洪烈,1,XX项目,1','周洪烈,1,基础研发,1'
+  ].join('\n');
+  document.getElementById('status').textContent='已载入示例数据，点击“自动生成分配结果（全部人员）”';
+};
+document.getElementById('file').addEventListener('change',e=>{
+  const f=e.target.files?.[0];
+  if(!f) return;
+  if(typeof XLSX === 'undefined'){
+    document.getElementById('status').textContent = '解析库未加载，请联网后刷新页面再上传';
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = ev => {
+    try{
+      const data = new Uint8Array(ev.target.result);
+      const wb = XLSX.read(data, {type:'array', cellStyles:true});
+      uploadedRows = extractRowsFromWorkbook(wb);
+      uploadedWorkbook = wb;
+      uploadedFileName = f.name;
+
+      // 回填到文本框，便于人工核对
+      document.getElementById('raw').value = uploadedRows
+        .map(r => `${r.name},${r.day},${r.project},${r.hours}`)
+        .join('\n');
+
+      document.getElementById('status').textContent = `已解析文件：${f.name}，识别到 ${uploadedRows.length} 条汇总数据`;
+    }catch(err){
+      uploadedRows = [];
+      uploadedWorkbook = null;
+      uploadedFileName = '';
+      document.getElementById('status').textContent = `解析失败：${err.message || err}`;
+    }
+  };
+  reader.readAsArrayBuffer(f);
+});
+</script>
+</body>
+</html>
